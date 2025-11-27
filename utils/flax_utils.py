@@ -199,7 +199,9 @@ def restore_agent(agent, restore_path, restore_epoch):
         restore_path: Path to the directory containing the saved agent.
         restore_epoch: Epoch number.
     """
+    print(f'Restoring from {restore_path} at epoch {restore_epoch}...')
     candidates = glob.glob(restore_path)
+    print(f'Found candidates: {candidates}')
 
     assert len(candidates) == 1, f'Found {len(candidates)} candidates: {candidates}'
 
