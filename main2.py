@@ -163,7 +163,7 @@ def sample_lane_filtered_batch(train_dataset, batch_size, sequence_length, disco
         # 有变道窗口: 权重 1.0
         # 直行窗口  : 权重 0.05
         alpha = 1.0
-        beta = 0.05
+        beta = 0.025
         total_weight = alpha * num_change_total + beta * num_nochange_total
         p_change = (alpha * num_change_total) / total_weight
 
