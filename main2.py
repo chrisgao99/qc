@@ -40,7 +40,6 @@ flags.DEFINE_integer('start_training', 5000, 'when does training start')
 flags.DEFINE_string('restore_path', None, 'Directory that contains params_XXXXXX.pkl.')
 flags.DEFINE_integer('restore_epoch', None, 'Epoch (step) of params_XXXXXX.pkl to load.')
 
-
 flags.DEFINE_integer('utd_ratio', 1, "update to data ratio")
 
 flags.DEFINE_float('discount', 0.99, 'discount factor')
@@ -65,6 +64,7 @@ flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
 flags.DEFINE_bool('save_all_online_states', False, "save all trajectories to npy")
 
+
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
         self.csv_loggers = csv_loggers
@@ -76,6 +76,7 @@ class LoggingHelper:
         assert prefix in self.csv_loggers, prefix
         self.csv_loggers[prefix].log(data, step=step)
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
+
 
 class FlattenObsWrapper(gym.ObservationWrapper):
     """
@@ -96,7 +97,8 @@ class FlattenObsWrapper(gym.ObservationWrapper):
     def observation(self, observation):
         return np.asarray(observation, dtype=np.float32).reshape(-1)
 
-    # ----- helper: sample batch with lane-change filtering (for Highway) -----
+
+# ----- helper: sample batch with lane-change filtering (for Highway) -----
 def sample_lane_filtered_batch(train_dataset, batch_size, sequence_length, discount):
     """
     和 Dataset.sample_sequence 行为尽量一致，只是：
@@ -267,7 +269,7 @@ def main(_):
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     flag_dict = get_flag_dict()
-    print("Flags:", flag_dict )
+    print("Flags:", flag_dict)
 
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
         json.dump(flag_dict, f)
@@ -278,9 +280,8 @@ def main(_):
     if FLAGS.highway_dataset_path is None:
         FLAGS.highway_dataset_path = "/p/yufeng/qc/highway_expert_30000.npz"
     
-    # data loading
-        # ---------------- data loading ----------------
-        # Priority: Highway dataset -> OGBench -> default make_env_and_datasets
+    # ---------------- data loading ----------------
+    # Priority: Highway dataset -> OGBench -> default make_env_and_datasets
     if FLAGS.highway_dataset_path is not None:
         print(f"Loading Highway dataset from: {FLAGS.highway_dataset_path}")
 
@@ -296,7 +297,7 @@ def main(_):
         actions = data["actions"].astype(np.float32)             # (N, 2)
         rewards = data["rewards"].astype(np.float32)             # (N,)
         terminals_bool = data["terminals"].astype(bool)          # (N,)
-        lanes = data["lanes"].astype(np.int32)                    # (N,)
+        lanes = data["lanes"].astype(np.int32)                   # (N,)
 
         N = observations.shape[0]
 
@@ -305,8 +306,6 @@ def main(_):
         print("Highway flat obs shape:", flat_obs.shape)
 
         # 3) Build next_observations by a simple shift
-        #    For t < N-1: next_obs[t] = obs[t+1]
-        #    For t == N-1: next_obs[N-1] = obs[N-1] (won't matter because mask will be 0 if terminal)
         next_flat_obs = np.empty_like(flat_obs)
         next_flat_obs[:-1] = flat_obs[1:]
         next_flat_obs[-1] = flat_obs[-1]
@@ -317,7 +316,7 @@ def main(_):
 
         # 5) Build raw dict that Dataset.create expects
         train_dataset = dict(
-            observations=flat_obs,          # (N, 70)
+            observations=flat_obs,           # (N, 70)
             next_observations=next_flat_obs,# (N, 70)
             actions=actions,                # (N, 2)
             rewards=rewards,                # (N,)
@@ -327,8 +326,6 @@ def main(_):
         )
         # For now, reuse the same data as 'val'
         val_dataset = train_dataset
-
-
 
     elif FLAGS.ogbench_dataset_dir is not None and FLAGS.ogbench_dataset_dir != "":
         # ===== original OGBench path =====
@@ -349,7 +346,6 @@ def main(_):
         # ===== generic env loader =====
         print("Using generic make_env_and_datasets")
         env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
-
 
     # house keeping
     random.seed(FLAGS.seed)
@@ -394,8 +390,6 @@ def main(_):
 
         return ds
 
-
-    
     train_dataset = process_train_dataset(train_dataset)
     example_batch = train_dataset.sample(())
     
@@ -412,7 +406,6 @@ def main(_):
     if FLAGS.restore_path is not None:
         print(f"Restoring agent from {FLAGS.restore_path}, epoch {FLAGS.restore_epoch}")
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
-
 
     # Setup logging.
     prefixes = ["eval", "env"]
@@ -444,7 +437,6 @@ def main(_):
             )
             train_dataset = process_train_dataset(train_dataset)
 
-        # batch = train_dataset.sample_sequence(config['batch_size'], sequence_length=FLAGS.horizon_length, discount=discount)
         batch = sample_lane_filtered_batch(
             train_dataset,
             batch_size=config['batch_size'],
@@ -486,11 +478,16 @@ def main(_):
         size=max(FLAGS.buffer_size, train_dataset.size + 1),
     )
 
-        
     ob, _ = env.reset()
     
     action_queue = []
     action_dim = example_batch["actions"].shape[-1]
+
+    # ====== NEW: Online episode statistics ======
+    ep_return = 0.0        # 当前 episode 的累积 reward（用 env 原始 reward）
+    ep_length = 0          # 当前 episode 的步数
+    num_episodes = 0       # 已完成的 episode 数
+    num_success = 0        # 成功 episode 数（长度 >= max_steps）
 
     # Online RL
     update_info = {}
@@ -501,19 +498,22 @@ def main(_):
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step += 1
         online_rng, key = jax.random.split(online_rng)
-        
+
         # during online rl, the action chunk is executed fully
         if len(action_queue) == 0:
             action = agent.sample_actions(observations=ob, rng=key)
 
             action_chunk = np.array(action).reshape(-1, action_dim)
-            for action in action_chunk:
-                action_queue.append(action)
-        # print("current action queue has these actions:", action_queue)
+            for action_one in action_chunk:
+                action_queue.append(action_one)
         action = action_queue.pop(0)
         
-        next_ob, int_reward, terminated, truncated, info = env.step(action)
+        next_ob, env_reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
+
+        # ====== NEW: 累积当前 episode 的原始 reward 和长度 ======
+        ep_return += float(env_reward)
+        ep_length += 1
 
         if FLAGS.save_all_online_states:
             state = env.get_state()
@@ -526,12 +526,15 @@ def main(_):
         
         # logging useful metrics from info dict
         env_info = {}
-        for key, value in info.items():
-            if key.startswith("distance"):
-                env_info[key] = value
+        for key2, value in info.items():
+            if key2.startswith("distance"):
+                env_info[key2] = value
         # always log this at every step
-        logger.log(env_info, "env", step=log_step)
+        if len(env_info) > 0:
+            logger.log(env_info, "env", step=log_step)
 
+        # 对 RL 用的 reward 做调整（D4RL / robomimic / sparse）
+        int_reward = env_reward
         if 'antmaze' in FLAGS.env_name and (
             'diverse' in FLAGS.env_name or 'play' in FLAGS.env_name or 'umaze' in FLAGS.env_name
         ):
@@ -557,22 +560,48 @@ def main(_):
         
         # done
         if done:
+            # ====== NEW: 这一局结束，更新 success 统计并 log 到 W&B ======
+            num_episodes += 1
+
+            # highway 成功条件：达到 max_steps 即 success
+            success = 1 if truncated else 0
+            num_success += success
+            success_rate = num_success / max(num_episodes, 1)
+
+            episode_info = {
+                "episode_return": ep_return,
+                "episode_length": ep_length,
+                "episode_success": success,
+                "success_rate": success_rate,
+            }
+            # 这里用 "online_agent" 前缀，这样 W&B 里是 online_agent/episode_return 等
+            logger.log(episode_info, "online_agent", step=log_step)
+
+            # 重置当前局统计
+            ep_return = 0.0
+            ep_length = 0
+
             ob, _ = env.reset()
             action_queue = []  # reset the action queue
         else:
             ob = next_ob
 
         if i >= FLAGS.start_training:
-            batch = replay_buffer.sample_sequence(config['batch_size'] * FLAGS.utd_ratio, 
-                        sequence_length=FLAGS.horizon_length, discount=discount)
-            batch = jax.tree.map(lambda x: x.reshape((
-                FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
+            batch = replay_buffer.sample_sequence(
+                config['batch_size'] * FLAGS.utd_ratio, 
+                sequence_length=FLAGS.horizon_length,
+                discount=discount
+            )
+            batch = jax.tree.map(
+                lambda x: x.reshape((FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]),
+                batch
+            )
 
             agent, update_info["online_agent"] = agent.batch_update(batch)
             
         if i % FLAGS.log_interval == 0:
-            for key, info in update_info.items():
-                logger.log(info, key, step=log_step)
+            for key3, info3 in update_info.items():
+                logger.log(info3, key3, step=log_step)
             update_info = {}
 
         if i == FLAGS.online_steps - 1 or \
@@ -593,16 +622,17 @@ def main(_):
 
     end_time = time.time()
 
-    for key, csv_logger in logger.csv_loggers.items():
+    for key4, csv_logger in logger.csv_loggers.items():
         csv_logger.close()
 
     if FLAGS.save_all_online_states:
-        c_data = {"steps": np.array(data["steps"]),
-                 "qpos": np.stack(data["qpos"], axis=0), 
-                 "qvel": np.stack(data["qvel"], axis=0), 
-                 "obs": np.stack(data["obs"], axis=0), 
-                 "offline_time": online_init_time - offline_init_time,
-                 "online_time": end_time - online_init_time,
+        c_data = {
+            "steps": np.array(data["steps"]),
+            "qpos": np.stack(data["qpos"], axis=0), 
+            "qvel": np.stack(data["qvel"], axis=0), 
+            "obs": np.stack(data["obs"], axis=0), 
+            "offline_time": online_init_time - offline_init_time,
+            "online_time": end_time - online_init_time,
         }
         if len(data["button_states"]) != 0:
             c_data["button_states"] = np.stack(data["button_states"], axis=0)
@@ -610,6 +640,7 @@ def main(_):
 
     with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
         f.write(run.url)
+
 
 if __name__ == '__main__':
     app.run(main)
