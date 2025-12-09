@@ -1,164 +1,211 @@
-# eval_ogbench_ckpt.py
-#
-# Evaluate a trained AC-FQL agent on OGBench envs (e.g., cube-triple-play-singletask-task2-v0):
-# - Load agent config from agents/acfql.py
-# - Restore checkpoint params_{step}.pkl
-# - Use evaluation.evaluate to run episodes and (optionally) record videos
-
 import os
-import glob
-from absl import app, flags
-from ml_collections import config_flags
 
+# --- CRITICAL FIX: Set these BEFORE importing ogbench/mujoco ---
+# This tells MuJoCo to use EGL (Headless GPU rendering) immediately.
+os.environ['MUJOCO_GL'] = 'egl' 
+
+# If you are on a CPU-only node, change 'egl' to 'osmesa'.
+# os.environ['MUJOCO_GL'] = 'osmesa' 
+
+# Set CUDA device IDs for EGL if available
+if 'CUDA_VISIBLE_DEVICES' in os.environ:
+    os.environ['EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
+    os.environ['MUJOCO_EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
+
+import json
+import ogbench
+import tqdm
 import jax
 import numpy as np
-import imageio.v2 as imageio
+import gymnasium as gym
+from absl import app, flags
+from ml_collections import config_flags
+from gymnasium.wrappers import RecordVideo
+
 from envs.ogbench_utils import make_ogbench_env_and_datasets
 from utils.flax_utils import restore_agent
-from utils.datasets import Dataset
-from evaluation import evaluate
 from agents import agents
 
 FLAGS = flags.FLAGS
 
-# ---------- basic flags ----------
+# ---------- Path & Env Flags ----------
+flags.DEFINE_string('env_name', 'cube-triple-play-singletask-task2-v0', 'Environment name.')
+flags.DEFINE_integer('seed', 42, 'Random seed.')
 
-flags.DEFINE_integer('seed', 0, 'Random seed.')
-
+# Checkpoint details
 flags.DEFINE_string(
-    'env_name',
-    'cube-triple-play-singletask-task2-v0',
-    'OGBench environment name.'
+    'ckpt_dir', 
+    '/p/yufeng/qc/exp/qc/reproduce/cube-triple-play-singletask-task2-v0/sd00020251124_103958', 
+    'Directory containing params_*.pkl'
 )
-flags.DEFINE_integer(
-    'horizon_length',
-    5,
-    'Action chunk length h (should match training).'
-)
-# agent config file (same style as main2.py)
-config_flags.DEFINE_config_file(
-    'agent', 'agents/acfql.py', lock_config=False
-)
+flags.DEFINE_integer('ckpt_step', 2000000, 'Checkpoint step to load.')
 
-# checkpoint info
-flags.DEFINE_string(
-    'ckpt_dir',
-    None,
-    'Directory containing params_*.pkl, e.g. /p/yufeng/qc/exp/...'
-)
-flags.DEFINE_integer(
-    'ckpt_step',
-    None,
-    'Checkpoint step to load, e.g. 100000 or 200000 (for params_{step}.pkl).'
-)
+# ---------- Config Flags ----------
+config_flags.DEFINE_config_file('agent', 'agents/acfql.py', lock_config=False)
+flags.DEFINE_integer('horizon_length', 5, 'Action chunk length h. MUST match training config.')
 
-# OGBench dataset dir (same as训练时)
-flags.DEFINE_string(
-    'ogbench_dataset_dir',
-    None,
-    'Directory with cube-triple-play .npz files (same as used for training).'
-)
+# ---------- Eval Settings ----------
+flags.DEFINE_integer('eval_episodes', 0, 'Number of evaluation episodes for stats.')
+flags.DEFINE_integer('video_episodes', 5, 'Number of episodes to record video.')
+flags.DEFINE_string('save_dir', 'eval_results/', 'Directory to save videos and stats.')
 
-# eval settings
-flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes.')
-flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes.')
-flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 
-# stats saving
-flags.DEFINE_string(
-    'stats_path',
-    None,
-    'If set, save eval stats (eval_info dict) as npz to this path.'
-)
+def run_eval_loop(agent, env, rng, horizon_length, num_episodes, desc="Eval"):
+    """
+    Main evaluation loop handling action chunking unrolling.
+    """
+    successes = []
+    returns = []
+    lengths = []
+    
+    action_dim = env.action_space.shape[-1]
+
+    for i in tqdm.tqdm(range(num_episodes), desc=desc):
+        rng, seed_key = jax.random.split(rng)
+        seed = int(jax.random.randint(seed_key, (), 0, 2**31 - 1))
+        
+        obs, _ = env.reset(seed=seed)
+        
+        done = False
+        ep_return = 0.0
+        ep_len = 0
+        ep_success = False
+        
+        action_queue = []
+
+        while not done:
+            # Check if we need to sample a new chunk
+            if len(action_queue) == 0:
+                rng, key = jax.random.split(rng)
+                # Agent returns flattened chunk: (horizon * action_dim,)
+                chunk_flat = agent.sample_actions(observations=obs, rng=key)
+                # Reshape to (horizon, action_dim)
+                chunk = np.array(chunk_flat).reshape(horizon_length, action_dim)
+                action_queue = [a for a in chunk]
+
+            # Execute next action in the chunk
+            action = action_queue.pop(0)
+            print(f"Step {ep_len}: Taking action {action}")
+
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            
+            done = terminated or truncated
+            ep_return += reward
+            ep_len += 1
+            obs = next_obs
+            
+            # Check success (standard OGBench key)
+            if 'success' in info and info['success']:
+                ep_success = True
+
+        successes.append(ep_success)
+        returns.append(ep_return)
+        lengths.append(ep_len)
+
+    return np.array(successes), np.array(returns), np.array(lengths)
 
 
 def main(_):
-    assert FLAGS.ckpt_dir is not None, "--ckpt_dir must be set"
-    assert FLAGS.ckpt_step is not None, "--ckpt_step must be set"
-    assert FLAGS.ogbench_dataset_dir is not None, "--ogbench_dataset_dir must be set"
-
-    _ = jax.random.PRNGKey(FLAGS.seed)
-
-    # ---------- pick one dataset file just to construct env ----------
-    dataset_paths = [
-        f for f in sorted(glob.glob(f"{FLAGS.ogbench_dataset_dir}/*.npz"))
-        if "-val.npz" not in f
-    ]
-    assert len(dataset_paths) > 0, f"No train datasets found in {FLAGS.ogbench_dataset_dir}"
-    dataset_path = dataset_paths[0]
-    print("Using dataset for env creation:", dataset_path)
-
-    # make env and datasets
-    env, eval_env, train_dataset, val_dataset = make_ogbench_env_and_datasets(
+    # 1. Setup paths
+    exp_name = os.path.basename(FLAGS.ckpt_dir)
+    full_save_dir = os.path.join(FLAGS.save_dir, FLAGS.env_name, exp_name, f"step_{FLAGS.ckpt_step}")
+    os.makedirs(full_save_dir, exist_ok=True)
+    
+    # 2. Create Environment (Fast Mode)
+    print(f"Creating environment '{FLAGS.env_name}'...")
+    
+    # Passing env_only=True skips the dataset download/load entirely.
+    eval_env = make_ogbench_env_and_datasets(
         FLAGS.env_name,
-        dataset_path=dataset_path,
-        compact_dataset=False,
+        env_only=True
     )
 
-    # ---------- load agent config & build agent ----------
+    # 3. Restore Agent
+    print(f"Restoring agent from {FLAGS.ckpt_dir} at step {FLAGS.ckpt_step}...")
+    rng = jax.random.PRNGKey(FLAGS.seed)
+    
+    # Create dummy samples to initialize agent shape
+    obs_sample = eval_env.observation_space.sample()
+    action_sample = eval_env.action_space.sample()
+    
     config = FLAGS.agent
-    # 确保和训练时的 horizon_length 一致
     config["horizon_length"] = FLAGS.horizon_length
 
-    # 这里 train_dataset 可能是 dict，需要先包成 Dataset
-    if isinstance(train_dataset, dict):
-        train_dataset = Dataset.create(**train_dataset)
-
-    # 和 main2.py 一样，用 sample(()) 拿一个 example_batch
-    example_batch = train_dataset.sample(())
-    obs_example = example_batch["observations"]
-    act_example = example_batch["actions"]
-    action_dim = act_example.shape[-1]
-
-    print("Obs example shape:", obs_example.shape)
-    print("Act example shape:", act_example.shape)
-    print("Action dim:", action_dim)
-
-    agent_class = agents[config["agent_name"]]
+    agent_class = agents[config['agent_name']]
     agent = agent_class.create(
         FLAGS.seed,
-        obs_example,
-        act_example,
+        obs_sample,
+        action_sample,
         config,
     )
 
-    print(f"Restoring agent from {FLAGS.ckpt_dir}, step {FLAGS.ckpt_step}")
     agent = restore_agent(agent, FLAGS.ckpt_dir, FLAGS.ckpt_step)
 
-    # ---------- evaluation ----------
-    print("=== Running evaluate() ===")
-    eval_info, videos, video_paths = evaluate(
-        agent=agent,
-        env=eval_env,
-        action_dim=action_dim,
-        num_eval_episodes=FLAGS.eval_episodes,
-        num_video_episodes=FLAGS.video_episodes,
-        video_frame_skip=FLAGS.video_frame_skip,
-    )
-
-    print("\n=== Eval Summary (eval_info) ===")
-    for k, v in eval_info.items():
-        print(f"{k}: {v}")
-
-    if FLAGS.video_episodes > 0 and videos is not None and len(videos) > 0:
-        out_dir = os.path.join(
-            FLAGS.ckpt_dir,
-            f"videos_step{FLAGS.ckpt_step}"
+    # 4. Run Numerical Evaluation
+    if FLAGS.eval_episodes > 0:
+        print(f"\n=== Running {FLAGS.eval_episodes} Eval Episodes ===")
+        successes, returns, lengths = run_eval_loop(
+            agent, eval_env, rng, FLAGS.horizon_length, FLAGS.eval_episodes, desc="Eval"
         )
-        os.makedirs(out_dir, exist_ok=True)
 
-        print(f"\nSaving {len(videos)} videos to: {out_dir}")
-        for i, vid in enumerate(videos):
-            # vid: shape (T, H, W, 3), uint8
-            out_path = os.path.join(out_dir, f"episode_{i:03d}.mp4")
-            # 这里用 imageio 写 mp4，fps 随便取个 30，你可以改
-            with imageio.get_writer(out_path, fps=30) as writer:
-                for frame in vid:
-                    writer.append_data(frame)
-            print("  saved:", out_path)
-    else:
-        print("\nNo videos returned (videos is None or empty).")
+        success_rate = np.mean(successes) * 100
+        avg_return = np.mean(returns)
+        avg_len = np.mean(lengths)
 
+        print("\n" + "-"*30)
+        print(f"Success Rate: {success_rate:.2f}%")
+        print(f"Avg Return:   {avg_return:.2f}")
+        print(f"Avg Length:   {avg_len:.2f}")
+        print("-"*30 + "\n")
 
-if __name__ == "__main__":
+        # Save stats
+        stats_path = os.path.join(full_save_dir, "eval_stats.json")
+        with open(stats_path, 'w') as f:
+            json.dump({
+                "success_rate": float(success_rate),
+                "avg_return": float(avg_return),
+                "avg_length": float(avg_len),
+                "episodes": FLAGS.eval_episodes
+            }, f, indent=4)
+
+    # 5. Run Video Evaluation
+    if FLAGS.video_episodes > 0:
+        print(f"=== Recording {FLAGS.video_episodes} Video Episodes ===")
+        
+        # Close the previous environment to free resources
+        eval_env.close()
+
+        print("Creating video environment...")
+        # Re-create environment
+        env = make_ogbench_env_and_datasets(
+            FLAGS.env_name,
+            env_only=True
+        )
+
+        # Force render mode on the base environment
+        env.unwrapped.render_mode = "rgb_array"
+
+        # Patch metadata
+        if not hasattr(env.unwrapped, 'metadata') or env.unwrapped.metadata is None:
+            env.unwrapped.metadata = {}
+        env.unwrapped.metadata = dict(env.unwrapped.metadata)
+        env.unwrapped.metadata['render_modes'] = ["rgb_array"]
+
+        # Setup Video Wrapper
+        video_path = os.path.join(full_save_dir, "videos")
+        video_env = RecordVideo(
+            env, 
+            video_folder=video_path,
+            episode_trigger=lambda x: True, 
+            name_prefix="eval_video"
+        )
+
+        _, _, _ = run_eval_loop(
+            agent, video_env, rng, FLAGS.horizon_length, FLAGS.video_episodes, desc="Video"
+        )
+        
+        video_env.close()
+        print(f"Videos saved to: {video_path}")
+
+if __name__ == '__main__':
     app.run(main)

@@ -135,7 +135,7 @@ def run_eval_episodes(agent, env, rng, horizon_length, num_episodes, max_steps):
     action_dim = env.action_space.shape[-1]
 
     for ep in range(num_episodes):
-        print(f"\n=== Eval Episode {ep + 1} / {num_episodes} ===")
+        # print(f"\n=== Eval Episode {ep + 1} / {num_episodes} ===")
         obs, _ = env.reset(seed=int(jax.random.randint(rng, (), 0, 2**31 - 1)))
         done = False
         ep_return = 0.0
@@ -169,11 +169,11 @@ def run_eval_episodes(agent, env, rng, horizon_length, num_episodes, max_steps):
         # 这里和你之前脚本保持一致：truncated 视为成功
         success_flags.append(bool(truncated))
 
-        print(
-            f"[Eval] Episode {ep + 1}/{num_episodes} - "
-            f"Return: {ep_return:.2f}, Len: {ep_len}, "
-            f"terminated={terminated}, truncated={truncated}"
-        )
+        # print(
+        #     f"[Eval] Episode {ep + 1}/{num_episodes} - "
+        #     f"Return: {ep_return:.2f}, Len: {ep_len}, "
+        #     f"terminated={terminated}, truncated={truncated}"
+        # )
 
     return np.array(returns), np.array(lengths), np.array(success_flags)
 
@@ -194,8 +194,8 @@ def main(_):
     obs_shape = eval_env.observation_space.shape
     act_shape = eval_env.action_space.shape
 
-    print("Obs shape:", obs_shape)
-    print("Act shape:", act_shape)
+    # print("Obs shape:", obs_shape)
+    # print("Act shape:", act_shape)
 
     # dummy example obs/actions to init agent
     example_obs = np.zeros(obs_shape, dtype=np.float32)
@@ -214,7 +214,7 @@ def main(_):
     agent = restore_agent(agent, FLAGS.ckpt_dir, FLAGS.ckpt_step)
 
     # ---------- evaluation without video ----------
-    print("=== Running evaluation episodes (no video) ===")
+    # print("=== Running evaluation episodes (no video) ===")
     returns, lengths, success_flags = run_eval_episodes(
         agent=agent,
         env=eval_env,
