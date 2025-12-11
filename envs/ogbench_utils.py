@@ -138,7 +138,7 @@ def make_ogbench_env_and_datasets(
     dataset_add_info = add_info
     env = cur_env
     eval_env = cur_env
-    if 'singletask' in splits:
+    if 'singletask' in splits or 'antmaze' in splits:
         # Single-task environment.
         pos = splits.index('singletask')
         env_name = '-'.join(splits[: pos - 1] + splits[pos:])  # Remove the dataset type.
@@ -192,7 +192,7 @@ def make_ogbench_env_and_datasets(
         dataset_size=dataset_size,
     )
 
-    if 'singletask' in splits:
+    if 'singletask' in splits or 'antmaze' in splits:
         # Add reward information to the datasets.
         from ogbench.relabel_utils import relabel_dataset
         relabel_dataset(env_name, env, train_dataset)

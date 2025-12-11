@@ -112,7 +112,6 @@ def main(_):
             - handle sparse reward
             - convert to action chunked dataset
         """
-
         ds = Dataset.create(**ds)
         if FLAGS.dataset_proportion < 1.0:
             new_size = int(len(ds['masks']) * FLAGS.dataset_proportion)
