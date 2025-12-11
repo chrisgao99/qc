@@ -6,7 +6,9 @@ from gymnasium.wrappers import RecordVideo
 # 1. Headless setup (Required for your cluster environment)
 os.environ['MUJOCO_GL'] = 'egl' 
 
-dataset_name = 'cube-triple-play-singletask-task2-v0'
+# dataset_name = 'cube-triple-play-singletask-task2-v0'
+dataset_name = 'antmaze-large-navigate-singletask-v0'
+dataset_name = 'antmaze-large-navigate-v0'
 env, train_dataset, val_dataset = ogbench.make_env_and_datasets(
     dataset_name=dataset_name, 
     dataset_dir=".ogbench/data"

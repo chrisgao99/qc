@@ -1,16 +1,5 @@
 import os
-
-# --- CRITICAL FIX: Set these BEFORE importing ogbench/mujoco ---
-# This tells MuJoCo to use EGL (Headless GPU rendering) immediately.
 os.environ['MUJOCO_GL'] = 'egl' 
-
-# If you are on a CPU-only node, change 'egl' to 'osmesa'.
-# os.environ['MUJOCO_GL'] = 'osmesa' 
-
-# Set CUDA device IDs for EGL if available
-if 'CUDA_VISIBLE_DEVICES' in os.environ:
-    os.environ['EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
-    os.environ['MUJOCO_EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
 
 import json
 import ogbench
@@ -72,7 +61,7 @@ def run_eval_loop(agent, env, rng, horizon_length, num_episodes, desc="Eval"):
         ep_success = False
         
         action_queue = []
-
+        save_frame = True
         while not done:
             # Check if we need to sample a new chunk
             if len(action_queue) == 0:
@@ -85,7 +74,7 @@ def run_eval_loop(agent, env, rng, horizon_length, num_episodes, desc="Eval"):
 
             # Execute next action in the chunk
             action = action_queue.pop(0)
-            print(f"Step {ep_len}: Taking action {action}")
+            # print(f"Step {ep_len}: Taking action {action}")
 
             next_obs, reward, terminated, truncated, info = env.step(action)
             
@@ -93,6 +82,15 @@ def run_eval_loop(agent, env, rng, horizon_length, num_episodes, desc="Eval"):
             ep_return += reward
             ep_len += 1
             obs = next_obs
+
+            frame = env.render()
+            #save frame as a png 
+            if save_frame:
+                frame_path = os.path.join(FLAGS.save_dir, f"episode_{i}_step_{ep_len}.png")
+                from PIL import Image
+                Image.fromarray(frame).save(frame_path)
+                save_frame = False  # Save only the first frame
+            
             
             # Check success (standard OGBench key)
             if 'success' in info and info['success']:
@@ -115,10 +113,14 @@ def main(_):
     print(f"Creating environment '{FLAGS.env_name}'...")
     
     # Passing env_only=True skips the dataset download/load entirely.
-    eval_env = make_ogbench_env_and_datasets(
-        FLAGS.env_name,
-        env_only=True
-    )
+    # eval_env = make_ogbench_env_and_datasets(
+    #     FLAGS.env_name,
+    #     env_only=True
+    # )
+    eval_env,_,_ = ogbench.make_env_and_datasets(
+            FLAGS.env_name,
+            dataset_dir=".ogbench/data"
+        )
 
     # 3. Restore Agent
     print(f"Restoring agent from {FLAGS.ckpt_dir} at step {FLAGS.ckpt_step}...")
@@ -177,19 +179,25 @@ def main(_):
 
         print("Creating video environment...")
         # Re-create environment
-        env = make_ogbench_env_and_datasets(
+        env,_,_ = ogbench.make_env_and_datasets(
             FLAGS.env_name,
-            env_only=True
+            dataset_dir=".ogbench/data"
         )
 
-        # Force render mode on the base environment
+
+        # 1. Force the render mode
         env.unwrapped.render_mode = "rgb_array"
 
-        # Patch metadata
+        # 2. Force the metadata to declare support for rgb_array
+        # This satisfies the passive_env_checker
         if not hasattr(env.unwrapped, 'metadata') or env.unwrapped.metadata is None:
             env.unwrapped.metadata = {}
-        env.unwrapped.metadata = dict(env.unwrapped.metadata)
+        env.unwrapped.metadata = dict(env.unwrapped.metadata) # Create a copy to be safe
         env.unwrapped.metadata['render_modes'] = ["rgb_array"]
+
+        # --- Wrapping ---
+        print(f"Metadata patched: {env.unwrapped.metadata}")
+
 
         # Setup Video Wrapper
         video_path = os.path.join(full_save_dir, "videos")

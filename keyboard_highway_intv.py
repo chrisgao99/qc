@@ -11,6 +11,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
 import cv2
+import pygame 
 
 # Assumes these modules exist in your project structure
 from utils_env import create_stateenv, config_state2
@@ -18,6 +19,14 @@ from utils.flax_utils import restore_agent
 from agents import agents
 
 FLAGS = flags.FLAGS
+
+
+# XLA_FLAGS="" MUJOCO_GL=egl python keyboard_highway_intv2.py --seed=1 --ckpt_dir=/p/yufeng/qc/exp/qc/highway_qcfql/highway-state/highway_lanefilter_3e6_h9 --ckpt_step=2400000 --classifier_path=data/h9_lane_classifier.pkl --eval_episodes=10 --video=True --horizon_length=9 --p_val 0.7
+
+# XLA_FLAGS="" MUJOCO_GL=egl python keyboard_highway_intv.py --seed=1 --ckpt_dir=/p/yufeng/qc/exp/qc/highway_qcfql/highway-state/highway_lanefilter_3e6_h7 --ckpt_step=2000000 --classifier_path=data/h7_lane_classifier.pkl --eval_episodes=10 --video=True --horizon_length=7 --p_val 0.7
+
+# XLA_FLAGS="" MUJOCO_GL=egl python keyboard_highway_intv.py --seed=1 --ckpt_dir=/p/yufeng/qc/exp/qc/highway_qcfql/highway-state/highway_lanefilter_3e6_h5 --ckpt_step=2800000 --classifier_path=data/h5_lane_classifier.pkl --eval_episodes=10 --video=True --horizon_length=5 --p_val 0.7
+
 
 # ---------- Flags ----------
 flags.DEFINE_integer('seed', 0, 'Random seed.')
@@ -28,18 +37,16 @@ flags.DEFINE_string('ckpt_dir', None, 'Directory containing params_*.pkl')
 flags.DEFINE_integer('ckpt_step', None, 'Checkpoint step to load.')
 
 flags.DEFINE_string('classifier_path', 'data/h5_lane_classifier.pkl', 'Path to trained LogisticRegression pickle.')
-flags.DEFINE_string('intervention_direction', 'right', 'Direction to force: left, right, or straight.')
-# This flag is now used if fixed_strength is None and we want a scalar base, 
-# though the new logic prioritizes 'fixed_strength' or 'auto'.
 
-flags.DEFINE_float('p_val', 0.99, 'Target probability for auto-strength calculation.')
+# Intervention Settings
+flags.DEFINE_float('p_val', 0.7, 'Target probability for auto-strength calculation.')
 flags.DEFINE_float('fixed_strength', None, 'If set, overrides auto-strength with this constant value.')
 
 flags.DEFINE_integer('eval_episodes', 10, 'Number of evaluation episodes.')
 flags.DEFINE_integer('max_steps_per_episode', 2000, 'Safety cap on episode length.')
 flags.DEFINE_integer('horizon_length', 9, 'Action chunk length.')
 flags.DEFINE_bool('video', False, 'Whether to record video.')
-flags.DEFINE_string('video_dir', 'videos/intervention/one-chunk/gs_weight_ortho2straight/auto_strength', 'Directory for videos.')
+flags.DEFINE_string('video_dir', 'videos/intervention/manual_keyboard', 'Directory for videos.')
 
 
 # ---------- Wrappers ----------
@@ -53,7 +60,13 @@ class TextOverlayWrapper(gym.Wrapper):
         self.current_text = text
 
     def render(self):
+        # In human mode, highway-env renders to pygame window.
+        # We grab the array to add text for the VideoRecorder or secondary display if needed.
+        # However, for interactive play, we usually view the Pygame window directly.
+        # This wrapper mainly helps if you are recording the screen or grabbing frames.
         frame = self.env.render()
+        
+        # If frame is None (e.g. standard human render might not return array depending on config), return
         if frame is None or not isinstance(frame, np.ndarray):
             return frame
 
@@ -69,7 +82,9 @@ class TextOverlayWrapper(gym.Wrapper):
         line_height = 25
         
         for line in lines:
+            # Outline
             cv2.putText(frame, line, (x, y), font, font_scale, (0, 0, 0), thickness + 2, line_type)
+            # Text
             cv2.putText(frame, line, (x, y), font, font_scale, color, thickness, line_type)
             y += line_height
         
@@ -88,20 +103,23 @@ class FlattenObsWrapper(gym.ObservationWrapper):
         return np.asarray(observation, dtype=np.float32).reshape(-1)
 
 def make_env_flat_with_overlay(video=False, video_folder=None, video_name_prefix='intervention'):
-    # config_state2["simulation_frequency"] = 30
+    config_state2["offscreen_rendering"] = False
+    config_state2["policy_frequency"] = 10
+    config_state2["simulation_frequency"] = 50
     env = create_stateenv(config_state2)
+    
     text_wrapper = TextOverlayWrapper(env)
     env = text_wrapper
     
     if video:
         os.makedirs(video_folder, exist_ok=True)
-        env = RecordVideo(
-            env,
-            video_folder=video_folder,
-            name_prefix=video_name_prefix,
-            episode_trigger=lambda ep_id: True,
-            disable_logger=True,
-        )
+        # env = RecordVideo(
+        #     env,
+        #     video_folder=video_folder,
+        #     name_prefix=video_name_prefix,
+        #     episode_trigger=lambda ep_id: True,
+        #     disable_logger=True,
+        # )
     env = FlattenObsWrapper(env)
     return env, text_wrapper
 
@@ -112,51 +130,46 @@ def load_classifier(classifier_path):
         clf = pickle.load(f)
     return clf
 
-def get_intervention_vector(clf, direction):
-    target_idx = -1
-    if direction == 'straight' or direction == 'stay':
-        target_idx = 0
-        # opposite_idx = 0  # No opposite for straight
-    elif direction == 'left':
-        target_idx = 1
-        # opposite_idx = 2
+def get_single_direction_vectors(clf, direction):
+    """Calculates the Base and Orthogonal vectors for a specific direction."""
+    if direction == 'left':
+        target_idx = 1 # Assumes class 1 is Left
+        # opp_idx = 2
     elif direction == 'right':
-        target_idx = 2
-        # opposite_idx = 1
+        target_idx = 2 # Assumes class 2 is Right
+        # opp_idx = 1
     else:
-        raise ValueError(f"Unknown direction: {direction}")
+        return None, None, None
+
+    # Get indices in the coefficient matrix
+    try:
+        class_index_in_matrix = np.where(clf.classes_ == target_idx)[0][0]
+        straight_index_in_matrix = np.where(clf.classes_ == 0)[0][0] 
+    except IndexError:
+        print(f"Error: Could not find class index for direction {direction}")
+        return None, None, None
+
+    weight_vector = clf.coef_[class_index_in_matrix]
+    straight_vector = clf.coef_[straight_index_in_matrix]
+
+    # Gram-Schmidt to make orthogonal to Straight direction
+    proj_length = np.dot(weight_vector, straight_vector) / np.dot(straight_vector, straight_vector)
+    proj_vector = proj_length * straight_vector
+    ortho_weight_vector = weight_vector - proj_vector
+
+    # Normalize
+    weight_vector = weight_vector / np.linalg.norm(weight_vector)
+    ortho_weight_vector = ortho_weight_vector / np.linalg.norm(ortho_weight_vector)
     
-    # Map target_idx (0,1,2) to the actual index in clf.coef_
-    # clf.classes_ might be [0, 1, 2]
-    if target_idx == 0:
-        # Straight case: no need to orthogonalize
-        class_index_in_matrix = np.where(clf.classes_ == target_idx)[0][0]
-        weight_vector = clf.coef_[class_index_in_matrix]
-        return jnp.array(weight_vector), None, class_index_in_matrix
-    else:
-        class_index_in_matrix = np.where(clf.classes_ == target_idx)[0][0]
-        straight_index_in_matrix = np.where(clf.classes_ == 0)[0][0] #actually, we should try minus the straight vector
-        
-        weight_vector = clf.coef_[class_index_in_matrix]
-        straight_vector = clf.coef_[straight_index_in_matrix]
-
-        # gram_schmidt to make orthogonal to opposite direction
-        proj_length = np.dot(weight_vector, straight_vector) / np.dot(straight_vector, straight_vector)
-        proj_vector = proj_length * straight_vector
-        ortho_weight_vector = weight_vector - proj_vector
-
-        weight_vector = weight_vector / np.linalg.norm(weight_vector)
-        ortho_weight_vector = ortho_weight_vector / np.linalg.norm(ortho_weight_vector)
-        
-        return jnp.array(weight_vector), jnp.array(ortho_weight_vector), class_index_in_matrix
+    return jnp.array(weight_vector), jnp.array(ortho_weight_vector), class_index_in_matrix
 
 @jax.jit
 def intervened_action_step(params, obs, noise, base_perturbation_vector, ortho_perturbation_vector,
                            clf_w, clf_b, target_class_idx, opp_class_idx, stay_class_idx,
                            apply_intervention, p_val, fixed_strength, use_fixed):
     """
-    If use_fixed is True: strength = fixed_strength.
-    Else: Calculate Auto Strength (simple for Straight, complex for L/R).
+    Standard JAX intervention step. 
+    apply_intervention (bool): Whether to add the perturbation.
     """
     x = jnp.concatenate([obs, noise], axis=-1)
     mlp_params = params['modules_actor_onestep_flow']['mlp']
@@ -170,73 +183,48 @@ def intervened_action_step(params, obs, noise, base_perturbation_vector, ortho_p
     feature = x 
     
     # --- 2. Compute Probs (Softmax) ---
-    logits = feature @ clf_w.T + clf_b  # shape (1, n_classes)
-    # jax.debug.print("Logits: {}", logits)
-    probs = nn.softmax(logits)          # shape (1, n_classes)
+    logits = feature @ clf_w.T + clf_b  
+    probs = nn.softmax(logits)          
     
     # --- 3. Compute Strength ---
-    
-    # Helper for the complex formula
     def _calc_complex(operands):
         _logits, _base, _ortho, _t_idx, _o_idx, _s_idx, _p = operands
-        
-        # C = p / (1 - p)
         C = _p / (1.0 - _p)
-
-        # Extract scalar logits
         L_target = _logits[0, _t_idx]
         L_opp    = _logits[0, _o_idx]
         L_stay   = _logits[0, _s_idx]
         
-        # Formula: ln(C*exp(R) + sqrt(C^2*e^(2R) + 4Ce^(L+S))) - ln2 - L
         term1 = C * jnp.exp(L_opp)
         term2_inside = (C**2) * jnp.exp(2 * L_opp) + 4 * C * jnp.exp(L_target + L_stay)
         term2 = jnp.sqrt(term2_inside)
         
         numerator = term1 + term2
         shift_val = jnp.log(numerator) - jnp.log(2.0) - L_target
-        
-        # Denom
         denom = jnp.dot(_base, _ortho)
-        # jax.debug.print("Denom: {}", denom)
         return shift_val / (denom + 1e-6)
 
-    # Helper for simple auto case (Straight)
-    def _calc_simple(operands):
-        return 0.5
-
-    # Logic for Auto: If Straight -> Simple, Else -> Complex
-    def _calc_auto(operands):
-        return jax.lax.cond(
-            target_class_idx == stay_class_idx,
-            _calc_simple,
-            _calc_complex,
-            operands
-        )
-        
-    # Helper to return fixed
     def _return_fixed(operands):
         return fixed_strength
 
-    # Pack operands
+    # Logic for Auto: If Straight -> Simple (0.5), Else -> Complex
+    # Since we only do L/R here, we mostly rely on complex, but we keep structure
+    def _calc_auto(operands):
+        return _calc_complex(operands)
+
     operands = (logits, base_perturbation_vector, ortho_perturbation_vector, 
                 target_class_idx, opp_class_idx, stay_class_idx, p_val)
 
-    # Top-level choice: Fixed vs Auto
     strength_to_use = jax.lax.cond(
         use_fixed,
         _return_fixed,
         _calc_auto,
         operands
     )
-    # strength_to_use must be positive
     strength_to_use = jnp.maximum(strength_to_use, 0.0)
     
     # --- 4. Apply Perturbation ---
     mask = apply_intervention.astype(jnp.float32)
-    
     total_perturbation = ortho_perturbation_vector * strength_to_use * mask
-    
     x_intervened = feature + total_perturbation
 
     # --- 5. Project to Action ---
@@ -247,78 +235,106 @@ def intervened_action_step(params, obs, noise, base_perturbation_vector, ortho_p
     
     return action, feature, probs, logits, strength_to_use
 
-# ---------- Eval Loop ----------
+# ---------- Interactive Loop ----------
 
-def run_intervention_episodes(agent, env, text_wrapper, clf, rng, horizon_length, num_episodes, max_steps, 
-                              base_perturbation, ortho_perturbation, target_idx_in_matrix, p_val, fixed_strength_val):
+def run_interactive_episodes(agent, env, text_wrapper, clf, rng, horizon_length, num_episodes, max_steps, 
+                             intervention_data, p_val, fixed_strength_val):
     
     action_dim = env.action_space.shape[-1]
     noise_dim = agent.config['action_dim'] * (agent.config['horizon_length'] if agent.config["action_chunking"] else 1)
     
-    # Prepare Classifier Weights for JAX
-    clf_w = jnp.array(clf.coef_)       # (n_classes, n_features)
-    clf_b = jnp.array(clf.intercept_)  # (n_classes,)
-    
-    lane_changes_left = 0
-    lane_changes_right = 0
-    
+    clf_w = jnp.array(clf.coef_)       
+    clf_b = jnp.array(clf.intercept_)
     idx_stay = int(np.where(clf.classes_ == 0)[0][0])
     idx_left = int(np.where(clf.classes_ == 1)[0][0])
     idx_right = int(np.where(clf.classes_ == 2)[0][0])
-
-    if target_idx_in_matrix == idx_left:
-        idx_opp = idx_right
-    elif target_idx_in_matrix == idx_right:
-        idx_opp = idx_left
-    else:
-        idx_opp = idx_left 
         
-    # Determine Fixed Strength Config
     use_fixed_strength = (fixed_strength_val is not None)
-    # JAX needs a float even if not used
     f_val = float(fixed_strength_val) if use_fixed_strength else 0.0
     
+    pygame.init()
+    clock = pygame.time.Clock()
+    
+    print("\n--- INTERACTIVE MODE START ---")
+    print("Controls: Tap LEFT or RIGHT to queue an intervention.")
+    print("Behavior: The last key pressed determines the NEXT chunk.")
+    
     for ep in range(num_episodes):
-        text_wrapper.set_text(f"Ep {ep+1} Start")
         obs, _ = env.reset()
-        
-        try:
-            start_lane = env.unwrapped.vehicle.lane_index[2]
-        except:
-            start_lane = -1
-            
         done = False
         ep_len = 0
         action_queue = []
-        First_chunk = True
         chunk_counter = 0
         
+        # Latch variable: Stores the last "command" you sent
+        pending_intervention = None 
+        current_display_mode = "STANDARD"
+
         while not done and ep_len < max_steps:
+            # --- 1. Event Listener (The Latch) ---
+            # Catches the key press instantly, even if you release it immediately.
+            for event in pygame.event.get():
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_LEFT:
+                        pending_intervention = 'left'
+                    elif event.key == pygame.K_RIGHT:
+                        pending_intervention = 'right'
+
+            # --- 2. Chunk Generation ---
             if len(action_queue) == 0:
                 chunk_counter += 1
                 rng, key = jax.random.split(rng)
                 
+                # A. Determine Direction
+                # Priority: 1. Latch (Recent Tap)  2. Holding Key  3. None
+                target_dir = pending_intervention
+                
+                # If no latch, check if user is physically holding the key (optional, but good for UX)
+                if target_dir is None:
+                    keys = pygame.key.get_pressed()
+                    if keys[pygame.K_LEFT]: target_dir = 'left'
+                    elif keys[pygame.K_RIGHT]: target_dir = 'right'
+
+                # B. Prepare Intervention
+                if target_dir and target_dir in intervention_data:
+                    vec_data = intervention_data[target_dir]
+                    base_vec = vec_data['base']
+                    ortho_vec = vec_data['ortho']
+                    t_idx = vec_data['target_idx']
+                    o_idx = idx_right if target_dir == 'left' else idx_left
+                    
+                    do_intervene = True
+                    current_display_mode = target_dir.upper()
+                else:
+                    # Default placeholders
+                    vec_data = intervention_data['left']
+                    base_vec = vec_data['base']
+                    ortho_vec = vec_data['ortho']
+                    t_idx = vec_data['target_idx']
+                    o_idx = idx_right
+                    
+                    do_intervene = False
+                    current_display_mode = "STANDARD"
+
+                # C. Consume the Latch
+                # We used the command, now we clear it so the *next* chunk isn't forced 
+                # unless you press/hold again.
+                pending_intervention = None
+
+                # D. JAX Execution
                 obs_jax = jnp.array([obs])
                 noise = jax.random.normal(key, (1, noise_dim))
                 
-                if First_chunk:
-                    do_intervene = True
-                    chunk_type_text = "INTERVENED"
-                else:
-                    do_intervene = False
-                    chunk_type_text = "Standard"
-
-                # Run JAX Step
-                chunk_raw, feature_jax, probs_jax, logits_jax, strength_val = intervened_action_step(
+                chunk_raw, _, probs_jax, _, strength_val = intervened_action_step(
                     agent.network.params, 
                     obs_jax, 
                     noise, 
-                    base_perturbation,
-                    ortho_perturbation,
+                    base_vec,
+                    ortho_vec,
                     clf_w,
                     clf_b,
-                    target_idx_in_matrix,
-                    idx_opp,
+                    t_idx,
+                    o_idx,
                     idx_stay,
                     do_intervene,
                     p_val,
@@ -326,65 +342,34 @@ def run_intervention_episodes(agent, env, text_wrapper, clf, rng, horizon_length
                     use_fixed_strength
                 )
                 
-                # --- Display Logic ---
+                # E. Update Text
                 probs = np.array(probs_jax)[0]
-                logits = np.array(logits_jax)[0]
-                strength_display = float(strength_val)
+                strength_display = float(strength_val) if do_intervene else 0.0
+                p_left = probs[idx_left] * 100
+                p_right = probs[idx_right] * 100
                 
-                p_left = probs[idx_left]
-                p_right = probs[idx_right]
-                
-                l_stay = logits[idx_stay]
-                l_left = logits[idx_left]
-                l_right = logits[idx_right]
-
-                if p_right > p_left:
-                    pct = p_right * 100
-                    direction_text = "Going Right"
-                else:
-                    pct = p_left * 100
-                    direction_text = "Going Left"
-                
-                display_str = strength_display if do_intervene else 0.0
-                
-                if use_fixed_strength:
-                    str_info = f"Fixed: {display_str:.2f}"
-                else:
-                    str_info = f"Auto(p={p_val}): {display_str:.4f}"
-
-                line1 = f"Chunk {chunk_counter} ({chunk_type_text}) | {direction_text}: {pct:.1f}%"
-                line2 = f"Logits -> S:{l_stay:.1f} L:{l_left:.1f} R:{l_right:.1f}"
-                line3 = f"{str_info}"
-                
-                text_wrapper.set_text(f"{line1}\n{line2}\n{line3}")
+                line1 = f"MODE: {current_display_mode} | Strength: {strength_display:.2f}"
+                line2 = f"Probs -> L:{p_left:.1f}% R:{p_right:.1f}%"
+                text_wrapper.set_text(f"{line1}\n{line2}")
                 
                 chunk = np.array(chunk_raw).reshape(horizon_length, action_dim)
                 action_queue = [a for a in chunk]
-                First_chunk = False
 
+            # --- 3. Step Environment ---
             action = action_queue.pop(0)
             next_obs, reward, terminated, truncated, _ = env.step(action)
+            env.render()
+            
             done = bool(terminated or truncated)
             ep_len += 1
             obs = next_obs
-        
-        try:
-            end_lane = env.unwrapped.vehicle.lane_index[2]
-            if start_lane != -1:
-                if end_lane < start_lane:
-                    lane_changes_left += 1
-                elif end_lane > start_lane:
-                    lane_changes_right += 1
-        except:
-            pass
             
-        print(f"Episode {ep+1}: Len {ep_len} | Start {start_lane} -> End {end_lane}")
-        env.close()
+            clock.tick(60) 
 
-    print("\n=== Summary ===")
-    print(f"Total Episodes: {num_episodes}")
-    print(f"Left: {lane_changes_left}, Right: {lane_changes_right}")
-
+        print(f"Episode {ep+1} Finished.")
+    env.close()
+qc/keyboard_highway_intv.py
+    pygame.quit()
 
 def main(_):
     assert FLAGS.ckpt_dir is not None, "Must provide --ckpt_dir"
@@ -396,6 +381,7 @@ def main(_):
     config = FLAGS.agent
     config["horizon_length"] = FLAGS.horizon_length
     
+    # Use 'human' render mode for interactive window
     eval_env, _ = make_env_flat_with_overlay(video=False) 
     obs_shape = eval_env.observation_space.shape
     act_shape = eval_env.action_space.shape
@@ -411,35 +397,33 @@ def main(_):
     # 2. Load Classifier
     clf = load_classifier(FLAGS.classifier_path)
     
-    # 3. Get Vectors
-    base_vector, ortho_weight_vector, target_idx_in_matrix = get_intervention_vector(clf, FLAGS.intervention_direction)
+    # 3. Pre-calculate Vectors for both Left and Right
+    print("Pre-calculating intervention vectors...")
+    intervention_data = {}
+    
+    for direction in ['left', 'right']:
+        base, ortho, t_idx = get_single_direction_vectors(clf, direction)
+        if base is not None:
+            intervention_data[direction] = {
+                'base': base,
+                'ortho': ortho,
+                'target_idx': t_idx
+            }
+        else:
+            raise ValueError(f"Failed to generate vectors for {direction}")
 
-    print("base*ortho dot:", jnp.dot(base_vector, ortho_weight_vector) if ortho_weight_vector is not None else "N/A")
+    # 4. Run Interactive Eval
+    mode_str = f"FIXED {FLAGS.fixed_strength}" if FLAGS.fixed_strength else f"AUTO (p={FLAGS.p_val})"
+    print(f"\nStarting Keyboard Intervention | {mode_str}")
     
-    # Handle Straight Case: ortho is None, but JAX needs an array
-    if ortho_weight_vector is None:
-        ortho_weight_vector = jnp.zeros_like(base_vector)
-    
-    print(f"Base Vector Shape: {base_vector.shape}")
-
-    # 3. Run Eval
-    if FLAGS.fixed_strength is not None:
-        mode_str = f"FIXED STRENGTH {FLAGS.fixed_strength}"
-    else:
-        mode_str = f"AUTO STRENGTH (p={FLAGS.p_val})"
-
-    print(f"\nRunning Intervention: Force {FLAGS.intervention_direction.upper()} | {mode_str}")
-    
-    env_prefix = f"int_{FLAGS.intervention_direction}_fix{FLAGS.fixed_strength}_p{FLAGS.p_val}"
-    
-    video_dir = os.path.join(FLAGS.video_dir, f"h{FLAGS.horizon_length}")
+    # Create env again for the loop
     env, text_wrapper = make_env_flat_with_overlay(
         video=FLAGS.video, 
-        video_folder=video_dir, 
-        video_name_prefix=env_prefix
+        video_folder=FLAGS.video_dir, 
+        video_name_prefix='manual'
     )
     
-    run_intervention_episodes(
+    run_interactive_episodes(
         agent=agent,
         env=env,
         text_wrapper=text_wrapper,
@@ -448,15 +432,12 @@ def main(_):
         horizon_length=FLAGS.horizon_length,
         num_episodes=FLAGS.eval_episodes,
         max_steps=FLAGS.max_steps_per_episode,
-        base_perturbation=base_vector,
-        ortho_perturbation=ortho_weight_vector, 
-        target_idx_in_matrix=target_idx_in_matrix,
+        intervention_data=intervention_data,
         p_val=FLAGS.p_val,
         fixed_strength_val=FLAGS.fixed_strength
     )
     
     env.close()
-
 
 if __name__ == "__main__":
     app.run(main)
