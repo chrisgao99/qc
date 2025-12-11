@@ -118,45 +118,40 @@ def make_ogbench_env_and_datasets(
         add_info=False,
         **env_kwargs,
 ):
-    """Make OGBench environment and load datasets.
-
-    Args:
-        dataset_name: Dataset name.
-        dataset_dir: Directory to save the datasets.
-        dataset_path: (Optional) Path to the dataset.
-        dataset_size: (Optional) Size of the dataset.
-        compact_dataset: Whether to return a compact dataset (True, without 'next_observations') or a regular dataset
-            (False, with 'next_observations').
-        env_only: Whether to return only the environment.
-        dataset_only: Whether to return only the dataset.
-        cur_env: Current environment (only used when `dataset_only` is True).
-        add_info: Whether to add observation information ('qpos', 'qvel', and 'button_states') to the datasets.
-        **env_kwargs: Keyword arguments to pass to the environment.
-    """
+    """Make OGBench environment and load datasets."""
+    
     # Make environment.
     splits = dataset_name.split('-')
     dataset_add_info = add_info
     env = cur_env
     eval_env = cur_env
-    if 'singletask' in splits or 'antmaze' in splits:
-        # Single-task environment.
-        pos = splits.index('singletask')
-        env_name = '-'.join(splits[: pos - 1] + splits[pos:])  # Remove the dataset type.
+
+    # --- 1. Special Handling for antmaze-large-navigate-v0 ---
+    if dataset_name == 'antmaze-large-navigate-v0':
+        env_name = 'antmaze-large-v0'
+        # We need 'qpos' to get the agent's actual XY location
+        dataset_add_info = True 
+        
         if not dataset_only:
             env = gymnasium.make(env_name, **env_kwargs)
             eval_env = gymnasium.make(env_name, **env_kwargs)
-        dataset_name = '-'.join(splits[:pos] + splits[-1:])  # Remove the words 'singletask' and 'task\d' (if exists).
+            
+    elif 'singletask' in splits:
+        pos = splits.index('singletask')
+        env_name = '-'.join(splits[: pos - 1] + splits[pos:])
+        if not dataset_only:
+            env = gymnasium.make(env_name, **env_kwargs)
+            eval_env = gymnasium.make(env_name, **env_kwargs)
+        dataset_name = '-'.join(splits[:pos] + splits[-1:])
         dataset_add_info = True
     elif 'oraclerep' in splits:
-        # Environment with oracle goal representations.
-        env_name = '-'.join(splits[:-3] + splits[-1:])  # Remove the dataset type and the word 'oraclerep'.
+        env_name = '-'.join(splits[:-3] + splits[-1:])
         if not dataset_only:
             env = gymnasium.make(env_name, use_oracle_rep=True, **env_kwargs)
-        dataset_name = '-'.join(splits[:-2] + splits[-1:])  # Remove the word 'oraclerep'.
+        dataset_name = '-'.join(splits[:-2] + splits[-1:])
         dataset_add_info = True
     else:
-        # Original, goal-conditioned environment.
-        env_name = '-'.join(splits[:-2] + splits[-1:])  # Remove the dataset type.
+        env_name = '-'.join(splits[:-2] + splits[-1:])
         if not dataset_only:
             env = gymnasium.make(env_name, **env_kwargs)
 
@@ -175,42 +170,68 @@ def make_ogbench_env_and_datasets(
 
     ob_dtype = np.uint8 if ('visual' in env_name or 'powderworld' in env_name) else np.float32
     action_dtype = np.int32 if 'powderworld' in env_name else np.float32
-    train_dataset = load_dataset(
-        train_dataset_path,
-        ob_dtype=ob_dtype,
-        action_dtype=action_dtype,
-        compact_dataset=compact_dataset,
-        add_info=dataset_add_info,
-        dataset_size=dataset_size,
-    )
-    val_dataset = load_dataset(
-        val_dataset_path,
-        ob_dtype=ob_dtype,
-        action_dtype=action_dtype,
-        compact_dataset=compact_dataset,
-        add_info=dataset_add_info,
-        dataset_size=dataset_size,
-    )
+    
+    def safe_load(path):
+        return load_dataset(
+            path,
+            ob_dtype=ob_dtype,
+            action_dtype=action_dtype,
+            compact_dataset=compact_dataset,
+            add_info=dataset_add_info, 
+            dataset_size=dataset_size,
+        )
 
-    if 'singletask' in splits or 'antmaze' in splits:
-        # Add reward information to the datasets.
+    train_dataset = safe_load(train_dataset_path)
+    val_dataset = safe_load(val_dataset_path)
+
+    # --- 2. Custom Relabeling for AntMaze Navigate (Multi-Task) ---
+    if dataset_name == 'antmaze-large-navigate-v0':
+        def label_antmaze_rewards(ds):
+            # A. Get Agent Position (x,y) from qpos
+            # qpos is (N, 15) for ant. Indices 0,1 are x,y.
+            if 'qpos' not in ds:
+                raise ValueError("Dataset missing 'qpos'. Ensure add_info=True is active.")
+            agent_xy = ds['qpos'][:, :2]
+            
+            # B. Get Goal Position (x,y) from Observations
+            # AntMaze observations are typically 29 dims: 27 proprioception + 2 goal
+            obs = ds['observations']
+            if obs.shape[1] != 29:
+                print(f"Warning: Expected observation dim 29 (27+2), got {obs.shape[1]}. Assuming last 2 are goal.")
+            
+            # Extract last 2 columns as goal
+            goal_xy = obs[:, -2:]
+
+            # C. Compute Rewards
+            dists = np.linalg.norm(agent_xy - goal_xy, axis=-1)
+            goal_tol = 0.5  # Standard AntMaze tolerance
+            successes = (dists <= goal_tol).astype(np.float32)
+
+            # 0.0 for success, -1.0 for step
+            ds['rewards'] = successes - 1.0
+            # Mask = 0.0 if success (done), 1.0 otherwise (continue)
+            ds['masks'] = 1.0 - successes
+
+        print("Manually relabeling AntMaze rewards via observations...")
+        label_antmaze_rewards(train_dataset)
+        label_antmaze_rewards(val_dataset)
+
+    # --- 3. Original Relabeling (Single Task Only) ---
+    if 'singletask' in splits:
         from ogbench.relabel_utils import relabel_dataset
         relabel_dataset(env_name, env, train_dataset)
         relabel_dataset(env_name, env, val_dataset)
 
     if 'oraclerep' in splits:
-        # Add oracle goal representations to the datasets.
         from ogbench.relabel_utils import add_oracle_reps
         add_oracle_reps(env_name, env, train_dataset)
         add_oracle_reps(env_name, env, val_dataset)
 
+    # Clean up info keys if user didn't request them
     if not add_info:
-        # Remove information keys.
         for k in ['qpos', 'qvel', 'button_states']:
-            if k in train_dataset:
-                del train_dataset[k]
-            if k in val_dataset:
-                del val_dataset[k]
+            if k in train_dataset: del train_dataset[k]
+            if k in val_dataset: del val_dataset[k]
 
     if dataset_only:
         return train_dataset, val_dataset

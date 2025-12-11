@@ -1,3 +1,4 @@
+import ogbench
 import glob, tqdm, wandb, os, json, random, time, jax
 from absl import app, flags
 from ml_collections import config_flags
@@ -91,9 +92,17 @@ def main(_):
             dataset_path=dataset_paths[dataset_idx],
             compact_dataset=False,
         )
+        # env, train_dataset, val_dataset = ogbench.make_env_and_datasets(
+        #     FLAGS.env_name,
+        #     dataset_path=dataset_paths[dataset_idx],
+        #     compact_dataset=False,
+        # )
+        # eval_env = env
     else:
-        env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
-
+        env, eval_env, train_dataset, val_dataset = make_ogbench_env_and_datasets(FLAGS.env_name)
+        # env, train_dataset, val_dataset = ogbench.make_env_and_datasets(FLAGS.env_name)
+        # eval_env = env
+    # print("the key of train dataset 1:", train_dataset.keys() )
     # house keeping
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
@@ -135,6 +144,7 @@ def main(_):
         return ds
     
     train_dataset = process_train_dataset(train_dataset)
+    # print("the key of train dataset 2:", train_dataset.keys() )
     example_batch = train_dataset.sample(())
     
     agent_class = agents[config['agent_name']]
@@ -166,15 +176,25 @@ def main(_):
         if FLAGS.ogbench_dataset_dir is not None and FLAGS.dataset_replace_interval != 0 and i % FLAGS.dataset_replace_interval == 0:
             dataset_idx = (dataset_idx + 1) % len(dataset_paths)
             print(f"Using new dataset: {dataset_paths[dataset_idx]}", flush=True)
-            train_dataset, val_dataset = make_ogbench_env_and_datasets(
+            # train_dataset, val_dataset = make_ogbench_env_and_datasets(
+            #     FLAGS.env_name,
+            #     dataset_path=dataset_paths[dataset_idx],
+            #     compact_dataset=False,
+            #     dataset_only=True,
+            #     cur_env=env,
+            # )
+            train_dataset, val_dataset = ogbench.make_env_and_datasets(
                 FLAGS.env_name,
                 dataset_path=dataset_paths[dataset_idx],
                 compact_dataset=False,
                 dataset_only=True,
                 cur_env=env,
             )
-            train_dataset = process_train_dataset(train_dataset)
+            # print("the key of train dataset 3:", train_dataset.keys() )
 
+            train_dataset = process_train_dataset(train_dataset)
+            # print("the key of train dataset 4:", train_dataset.keys() )
+        # print("the key of train dataset 5:", train_dataset.keys() )
         batch = train_dataset.sample_sequence(config['batch_size'], sequence_length=FLAGS.horizon_length, discount=discount)
 
         agent, offline_info = agent.update(batch)
