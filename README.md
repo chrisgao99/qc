@@ -68,12 +68,13 @@ MUJOCO_GL=egl python main_online.py --env_name=cube-triple-play-singletask-task2
 ```
 
 ```
-@article{li2025qc,
-  author = {Qiyang Li and Zhiyuan Zhou and Sergey Levine},
-  title  = {Reinforcement Learning with Action Chunking},
-  conference = {arXiv Pre-print},
-  year = {2025},
-  url = {http://arxiv.org/abs/2507.07969},
+@inproceedings{
+li2025reinforcement,
+title={Reinforcement Learning with Action Chunking},
+author={Qiyang Li and Zhiyuan Zhou and Sergey Levine},
+booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+year={2025},
+url={https://openreview.net/forum?id=XUks1Y96NR}
 }
 ```
 
