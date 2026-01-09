@@ -161,6 +161,173 @@ def add_to(dict_of_lists, single_dict):
 
 
 
+# def evaluate(
+#     agent,
+#     env,
+#     num_eval_episodes=50,
+#     num_video_episodes=0,
+#     video_frame_skip=3,
+#     eval_temperature=0,
+#     eval_gaussian=None,
+#     action_shape=None,
+#     observation_shape=None,
+#     action_dim=None,
+# ):
+#     """Evaluate the agent in the environment.
+
+#     Args:
+#         agent: Agent.
+#         env: Environment.
+#         num_eval_episodes: Number of episodes to evaluate the agent.
+#         num_video_episodes: Number of episodes to render. These episodes are not included in the statistics.
+#         video_frame_skip: Number of frames to skip between renders.
+#         eval_temperature: Action sampling temperature.
+#         eval_gaussian: Standard deviation of the Gaussian noise to add to the actions.
+
+#     Returns:
+#         A tuple containing the statistics, trajectories, and rendered videos.
+#     """
+#     actor_fn = supply_rng(
+#         agent.sample_actions,
+#         rng=jax.random.PRNGKey(np.random.randint(0, 2**32)),
+#     )
+#     trajs = []
+#     stats = defaultdict(list)
+
+#     renders = []
+#     for i in trange(num_eval_episodes + num_video_episodes):
+#         traj = defaultdict(list)
+#         should_render = i >= num_eval_episodes
+
+#         observation, info = env.reset()
+            
+#         observation_history = []
+#         action_history = []
+        
+#         done = False
+#         step = 0
+#         render = []
+#         action_chunk_lens = defaultdict(lambda: 0)
+
+#         action_queue = []
+
+#         gripper_contact_lengths = []
+#         gripper_contact_length = 0
+
+#         # ==== NEW: 跟踪这一局是否因为 truncated 结束 ====
+#         episode_truncated = False
+
+#         while not done:
+            
+#             action = actor_fn(observations=observation)
+
+#             if len(action_queue) == 0:
+#                 have_new_action = True
+#                 action = np.array(action).reshape(-1, action_dim)
+#                 action_chunk_len = action.shape[0]
+#                 for a in action:
+#                     action_queue.append(a)
+#             else:
+#                 have_new_action = False
+            
+#             action = action_queue.pop(0)
+#             if eval_gaussian is not None:
+#                 action = np.random.normal(action, eval_gaussian)
+
+#             next_observation, reward, terminated, truncated, info = env.step(
+#                 np.clip(action, -1, 1)
+#             )
+#             done = terminated or truncated
+#             step += 1
+
+#             # ==== NEW: 记录这一局是否因为 time-limit (truncated) 结束 ====
+#             if truncated:
+#                 episode_truncated = True
+
+#             if should_render and (step % video_frame_skip == 0 or done):
+#                 frame = env.render().copy()
+#                 render.append(frame)
+
+#             transition = dict(
+#                 observation=observation,
+#                 next_observation=next_observation,
+#                 action=action,
+#                 reward=reward,
+#                 done=done,
+#                 info=info,
+#             )
+#             add_to(traj, transition)
+            
+#             observation = next_observation
+
+#             if "proprio" in info and "gripper_contact" in info["proprio"]:
+#                 gripper_contact = info["proprio"]["gripper_contact"]
+#             elif "gripper_contact" in info:
+#                 gripper_contact = info["gripper_contact"]
+#             else:
+#                 gripper_contact = None
+
+#             if gripper_contact is not None:
+#                 if info["gripper_contact"] > 0.1:
+#                     gripper_contact_length += 1
+#                 else:
+#                     if gripper_contact_length > 0:
+#                         gripper_contact_lengths.append(gripper_contact_length)
+#                     gripper_contact_length = 0
+
+#         if gripper_contact_length > 0:
+#             gripper_contact_lengths.append(gripper_contact_length)
+        
+#         num_gripper_contacts = len(gripper_contact_lengths)
+
+#         if num_gripper_contacts > 0:
+#             avg_gripper_contact_length = np.mean(
+#                 np.array(gripper_contact_lengths)
+#             )
+#         else:
+#             avg_gripper_contact_length = 0
+            
+#         add_to(
+#             stats,
+#             {
+#                 "avg_gripper_contact_length": avg_gripper_contact_length,
+#                 "num_gripper_contacts": num_gripper_contacts,
+#             },
+#         )
+
+#         # ==== NEW: 计算 episode return / length / success ====
+#         ep_return = float(np.sum(traj["reward"])) if "reward" in traj else 0.0
+#         ep_length = len(traj["reward"])
+#         # 用 truncated 判断 success：如果是 time-limit 结束就是 success
+#         ep_success = 1.0 if episode_truncated else 0.0
+
+#         if i < num_eval_episodes:
+#             # 原有：把最后一个 info 展平成指标
+#             add_to(stats, flatten(info))
+#             # 新增：把本局统计加入 stats
+#             add_to(
+#                 stats,
+#                 {
+#                     "episode_return": ep_return,
+#                     "episode_length": ep_length,
+#                     "episode_success": ep_success,
+#                 },
+#             )
+#             trajs.append(traj)
+#         else:
+#             renders.append(np.array(render))
+
+#     # 对所有统计项取均值
+#     for k, v in stats.items():
+#         stats[k] = np.mean(v)
+
+#     # ==== NEW: success_rate 作为 episode_success 的别名 ====
+#     if "episode_success" in stats:
+#         stats["success_rate"] = stats["episode_success"]
+
+#     return stats, trajs, renders
+
+
 def evaluate(
     agent,
     env,
@@ -173,62 +340,64 @@ def evaluate(
     observation_shape=None,
     action_dim=None,
 ):
-    """Evaluate the agent in the environment.
-
-    Args:
-        agent: Agent.
-        env: Environment.
-        num_eval_episodes: Number of episodes to evaluate the agent.
-        num_video_episodes: Number of episodes to render. These episodes are not included in the statistics.
-        video_frame_skip: Number of frames to skip between renders.
-        eval_temperature: Action sampling temperature.
-        eval_gaussian: Standard deviation of the Gaussian noise to add to the actions.
-
-    Returns:
-        A tuple containing the statistics, trajectories, and rendered videos.
-    """
+    """Evaluate the agent in the environment with Goal-Conditioning."""
+    
     actor_fn = supply_rng(
         agent.sample_actions,
         rng=jax.random.PRNGKey(np.random.randint(0, 2**32)),
     )
     trajs = []
     stats = defaultdict(list)
-
     renders = []
+
+    # Helper for concatenation
+    def get_gc_obs(obs, goal):
+        return np.concatenate([obs, goal[:2]], axis=-1)
+
     for i in trange(num_eval_episodes + num_video_episodes):
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
 
         observation, info = env.reset()
-            
-        observation_history = []
-        action_history = []
         
+        # --- [START] Goal Retrieval Logic ---
+        # 1. Try info (standard)
+        goal = info.get('goal', None)
+        
+        # 2. Try env attribute (common fallback)
+        if goal is None:
+            if hasattr(env.unwrapped, 'goal'):
+                goal = env.unwrapped.goal
+            elif hasattr(env, 'goal'):
+                goal = env.goal
+        
+        # 3. Safety fallback
+        if goal is None:
+            # print("Warning: Goal not found in eval env. Using zeros.")
+            goal = np.zeros_like(observation)
+        # --- [END] Goal Retrieval Logic ---
+
         done = False
         step = 0
         render = []
-        action_chunk_lens = defaultdict(lambda: 0)
-
         action_queue = []
-
+        
         gripper_contact_lengths = []
         gripper_contact_length = 0
-
-        # ==== NEW: 跟踪这一局是否因为 truncated 结束 ====
+        
+        # Tracking success
         episode_truncated = False
 
         while not done:
-            
-            action = actor_fn(observations=observation)
+            # --- [START] Use GC Observation ---
+            obs_gc = get_gc_obs(observation, goal)
+            action = actor_fn(observations=obs_gc)
+            # --- [END] ---
 
             if len(action_queue) == 0:
-                have_new_action = True
                 action = np.array(action).reshape(-1, action_dim)
-                action_chunk_len = action.shape[0]
                 for a in action:
                     action_queue.append(a)
-            else:
-                have_new_action = False
             
             action = action_queue.pop(0)
             if eval_gaussian is not None:
@@ -240,7 +409,6 @@ def evaluate(
             done = terminated or truncated
             step += 1
 
-            # ==== NEW: 记录这一局是否因为 time-limit (truncated) 结束 ====
             if truncated:
                 episode_truncated = True
 
@@ -248,9 +416,12 @@ def evaluate(
                 frame = env.render().copy()
                 render.append(frame)
 
+            # Note: We store raw observations in trajectory for analysis, 
+            # but you can store obs_gc if you prefer.
             transition = dict(
                 observation=observation,
                 next_observation=next_observation,
+                goal=goal, # Optional: save goal to trajectory
                 action=action,
                 reward=reward,
                 done=done,
@@ -260,6 +431,7 @@ def evaluate(
             
             observation = next_observation
 
+            # Gripper contact logic
             if "proprio" in info and "gripper_contact" in info["proprio"]:
                 gripper_contact = info["proprio"]["gripper_contact"]
             elif "gripper_contact" in info:
@@ -279,49 +451,42 @@ def evaluate(
             gripper_contact_lengths.append(gripper_contact_length)
         
         num_gripper_contacts = len(gripper_contact_lengths)
-
         if num_gripper_contacts > 0:
-            avg_gripper_contact_length = np.mean(
-                np.array(gripper_contact_lengths)
-            )
+            avg_gripper_contact_length = np.mean(np.array(gripper_contact_lengths))
         else:
             avg_gripper_contact_length = 0
             
-        add_to(
-            stats,
-            {
-                "avg_gripper_contact_length": avg_gripper_contact_length,
-                "num_gripper_contacts": num_gripper_contacts,
-            },
-        )
+        add_to(stats, {
+            "avg_gripper_contact_length": avg_gripper_contact_length,
+            "num_gripper_contacts": num_gripper_contacts,
+        })
 
-        # ==== NEW: 计算 episode return / length / success ====
+        # Metrics
         ep_return = float(np.sum(traj["reward"])) if "reward" in traj else 0.0
         ep_length = len(traj["reward"])
-        # 用 truncated 判断 success：如果是 time-limit 结束就是 success
-        ep_success = 1.0 if episode_truncated else 0.0
+        
+        # Check for OGBench specific success metric first
+        if 'success' in info:
+            ep_success = float(info['success'])
+        else:
+            # Fallback to your logic (truncated = success?)
+            # Usually truncated means timeout (failure), but keeping your logic if intended:
+            ep_success = 1.0 if episode_truncated else 0.0
 
         if i < num_eval_episodes:
-            # 原有：把最后一个 info 展平成指标
             add_to(stats, flatten(info))
-            # 新增：把本局统计加入 stats
-            add_to(
-                stats,
-                {
-                    "episode_return": ep_return,
-                    "episode_length": ep_length,
-                    "episode_success": ep_success,
-                },
-            )
+            add_to(stats, {
+                "episode_return": ep_return,
+                "episode_length": ep_length,
+                "episode_success": ep_success,
+            })
             trajs.append(traj)
         else:
             renders.append(np.array(render))
 
-    # 对所有统计项取均值
     for k, v in stats.items():
         stats[k] = np.mean(v)
 
-    # ==== NEW: success_rate 作为 episode_success 的别名 ====
     if "episode_success" in stats:
         stats["success_rate"] = stats["episode_success"]
 

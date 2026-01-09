@@ -126,10 +126,20 @@ def make_ogbench_env_and_datasets(
     env = cur_env
     eval_env = cur_env
 
-    # --- 1. Special Handling for antmaze-large-navigate-v0 ---
-    if dataset_name == 'antmaze-large-navigate-v0':
-        env_name = 'antmaze-large-v0'
-        # We need 'qpos' to get the agent's actual XY location
+    # --- 1. Generalized Handling for ALL AntMaze Navigate tasks ---
+    # Matches: antmaze-umaze-navigate-v0, antmaze-medium-navigate-v0, antmaze-large-navigate-v0
+    is_antmaze_navigate = (
+        dataset_name.startswith('antmaze') and 
+        'navigate' in dataset_name and 
+        'singletask' not in dataset_name
+    )
+
+    if is_antmaze_navigate:
+        # Convert 'antmaze-size-navigate-v0' -> 'antmaze-size-v0'
+        # e.g., antmaze-medium-navigate-v0 -> antmaze-medium-v0
+        env_name = dataset_name.replace('-navigate', '')
+        
+        # We need 'qpos' to get the agent's actual XY location for relabeling
         dataset_add_info = True 
         
         if not dataset_only:
@@ -184,37 +194,48 @@ def make_ogbench_env_and_datasets(
     train_dataset = safe_load(train_dataset_path)
     val_dataset = safe_load(val_dataset_path)
 
-    # --- 2. Custom Relabeling for AntMaze Navigate (Multi-Task) ---
-    if dataset_name == 'antmaze-large-navigate-v0':
-        def label_antmaze_rewards(ds):
+    # --- 2. Custom Relabeling for AntMaze Navigate (All Sizes) ---
+    if is_antmaze_navigate:
+        def label_antmaze_rewards(env, ds, dense=True):            
             # A. Get Agent Position (x,y) from qpos
-            # qpos is (N, 15) for ant. Indices 0,1 are x,y.
             if 'qpos' not in ds:
                 raise ValueError("Dataset missing 'qpos'. Ensure add_info=True is active.")
+            
+            # qpos[:2] is strictly (x, y) for the Ant robot regardless of maze size
             agent_xy = ds['qpos'][:, :2]
             
-            # B. Get Goal Position (x,y) from Observations
-            # AntMaze observations are typically 29 dims: 27 proprioception + 2 goal
-            obs = ds['observations']
-            if obs.shape[1] != 29:
-                print(f"Warning: Expected observation dim 29 (27+2), got {obs.shape[1]}. Assuming last 2 are goal.")
+            # Note: Assuming goal is fixed in the environment or user wants
+            # to target the specific goal set in 'env'.
+            goal_xy = env.unwrapped.cur_goal_xy
+            goal_tol = env.unwrapped._goal_tol
             
-            # Extract last 2 columns as goal
-            goal_xy = obs[:, -2:]
+            # B. Get Goal Position (x,y) from Observations (Validation only)
+            obs = ds['observations']
+            # Warning: Obs dim might vary between Maze sizes (though typically 29 for Ant)
+            if obs.shape[1] != 29:
+                # Just a warning, not a hard stop, as some envs might differ
+                print(f"Warning: Expected observation dim 29, got {obs.shape[1]}. Proceeding with qpos.")
 
-            # C. Compute Rewards
+            # C. Compute Distances and Successes
             dists = np.linalg.norm(agent_xy - goal_xy, axis=-1)
-            goal_tol = 0.5  # Standard AntMaze tolerance
             successes = (dists <= goal_tol).astype(np.float32)
 
-            # 0.0 for success, -1.0 for step
-            ds['rewards'] = successes - 1.0
+            # D. Assign Rewards based on Flag
+            if dense:
+                # Dense: Negative Euclidean distance (closer is better, max is 0)
+                ds['rewards'] = -dists
+            else:
+                # Sparse: -1.0 per step, 0.0 if goal reached
+                ds['rewards'] = successes - 1.0
+
             # Mask = 0.0 if success (done), 1.0 otherwise (continue)
             ds['masks'] = 1.0 - successes
+            
+            return ds
 
-        print("Manually relabeling AntMaze rewards via observations...")
-        label_antmaze_rewards(train_dataset)
-        label_antmaze_rewards(val_dataset)
+        print(f"Manually relabeling {dataset_name} rewards via observations...")
+        label_antmaze_rewards(env, train_dataset, dense=True)
+        label_antmaze_rewards(env, val_dataset, dense=True)
 
     # --- 3. Original Relabeling (Single Task Only) ---
     if 'singletask' in splits:

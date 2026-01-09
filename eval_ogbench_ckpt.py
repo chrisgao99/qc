@@ -10,10 +10,11 @@ import gymnasium as gym
 from absl import app, flags
 from ml_collections import config_flags
 from gymnasium.wrappers import RecordVideo
-
+import mujoco
 from envs.ogbench_utils import make_ogbench_env_and_datasets
 from utils.flax_utils import restore_agent
 from agents import agents
+from utils_ant import CustomFixedStateWrapper, get_gc_obs
 
 FLAGS = flags.FLAGS
 
@@ -53,7 +54,12 @@ def run_eval_loop(agent, env, rng, horizon_length, num_episodes, desc="Eval"):
         rng, seed_key = jax.random.split(rng)
         seed = int(jax.random.randint(seed_key, (), 0, 2**31 - 1))
         
-        obs, _ = env.reset(seed=seed)
+        obs, info = env.reset(seed=0)
+
+        current_goal = info.get('goal', None)
+        print(f"Episode {i}: Goal: {current_goal}")
+        goal = env.unwrapped.cur_goal_xy
+        print(f"Episode {i}: True Goal: {goal}")
         
         done = False
         ep_return = 0.0
@@ -62,12 +68,19 @@ def run_eval_loop(agent, env, rng, horizon_length, num_episodes, desc="Eval"):
         
         action_queue = []
         save_frame = True
+        last_position = obs[:2]
+        sum_delta_distance = 0.0
         while not done:
             # Check if we need to sample a new chunk
             if len(action_queue) == 0:
+                new_position = obs[:2]  
+                delta_distance = np.linalg.norm(new_position - last_position)
+                sum_delta_distance += delta_distance
+                last_position = new_position
                 rng, key = jax.random.split(rng)
                 # Agent returns flattened chunk: (horizon * action_dim,)
-                chunk_flat = agent.sample_actions(observations=obs, rng=key)
+                obs_gc = get_gc_obs(obs, current_goal)
+                chunk_flat = agent.sample_actions(observations=obs_gc, rng=key)
                 # Reshape to (horizon, action_dim)
                 chunk = np.array(chunk_flat).reshape(horizon_length, action_dim)
                 action_queue = [a for a in chunk]
@@ -95,6 +108,8 @@ def run_eval_loop(agent, env, rng, horizon_length, num_episodes, desc="Eval"):
             # Check success (standard OGBench key)
             if 'success' in info and info['success']:
                 ep_success = True
+        average_delta_distance = sum_delta_distance / ep_len if ep_len > 0 else 0.0
+        print(f"Episode {i} average step distance per action chunk: {average_delta_distance:.4f}")
 
         successes.append(ep_success)
         returns.append(ep_return)
@@ -102,6 +117,47 @@ def run_eval_loop(agent, env, rng, horizon_length, num_episodes, desc="Eval"):
 
     return np.array(successes), np.array(returns), np.array(lengths)
 
+class StepOverlayWrapper(gym.Wrapper):
+    """
+    Wraps the environment to draw the current step count on the rendered frame.
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        self.step_count = 0
+
+    def reset(self, **kwargs):
+        self.step_count = 0
+        return super().reset(**kwargs)
+
+    def step(self, action):
+        self.step_count += 1
+        return super().step(action)
+
+    def render(self):
+        # 1. Get the original frame
+        frame = self.env.render()
+        
+        # 2. Draw text if frame is valid
+        if frame is not None and isinstance(frame, np.ndarray):
+            from PIL import Image, ImageDraw
+            
+            # Convert numpy array to PIL Image
+            img = Image.fromarray(frame)
+            draw = ImageDraw.Draw(img)
+            
+            text = f"Step: {self.step_count}"
+            x, y = 10, 10  # Top-left corner position
+            
+            # Draw a black outline/shadow for visibility against any background
+            for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                draw.text((x + dx, y + dy), text, fill="black")
+            
+            # Draw the main white text
+            draw.text((x, y), text, fill="white")
+            
+            return np.array(img)
+            
+        return frame
 
 def main(_):
     # 1. Setup paths
@@ -112,15 +168,19 @@ def main(_):
     # 2. Create Environment (Fast Mode)
     print(f"Creating environment '{FLAGS.env_name}'...")
     
-    # Passing env_only=True skips the dataset download/load entirely.
-    # eval_env = make_ogbench_env_and_datasets(
-    #     FLAGS.env_name,
-    #     env_only=True
-    # )
+    my_custom_goal = None
+    my_custom_start = None
+
     eval_env,_,_ = ogbench.make_env_and_datasets(
             FLAGS.env_name,
             dataset_dir=".ogbench/data"
         )
+
+    eval_env = CustomFixedStateWrapper(
+        eval_env, 
+        fixed_goal=my_custom_goal, 
+        fixed_qpos=my_custom_start
+    )
 
     # 3. Restore Agent
     print(f"Restoring agent from {FLAGS.ckpt_dir} at step {FLAGS.ckpt_step}...")
@@ -184,6 +244,12 @@ def main(_):
             dataset_dir=".ogbench/data"
         )
 
+        env = CustomFixedStateWrapper(
+            env, 
+            fixed_goal=my_custom_goal, 
+            fixed_qpos=my_custom_start
+        )
+
 
         # 1. Force the render mode
         env.unwrapped.render_mode = "rgb_array"
@@ -198,6 +264,7 @@ def main(_):
         # --- Wrapping ---
         print(f"Metadata patched: {env.unwrapped.metadata}")
 
+        env = StepOverlayWrapper(env)
 
         # Setup Video Wrapper
         video_path = os.path.join(full_save_dir, "videos")

@@ -220,7 +220,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             vels = self.network.select('actor_bc_flow')(observations, actions, t, is_encoded=True)
             actions = actions + vels / self.config['flow_steps']
         actions = jnp.clip(actions, -1, 1)
-        return actions
+        return actions 
 
     @classmethod
     def create(
